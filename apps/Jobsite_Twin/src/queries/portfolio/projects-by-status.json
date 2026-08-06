@@ -1,0 +1,21 @@
+{
+    "$schema": "https://vega.github.io/schema/vega-lite/v6.json",
+    "description": "Share of projects by delivery status.",
+    "data": {},
+    "mark": { "type": "arc", "innerRadius": 70 },
+    "encoding": {
+        "theta": { "field": "ProjectCount", "type": "quantitative" },
+        "color": {
+            "field": "Status",
+            "type": "nominal",
+            "scale": {
+                "domain": ["On Track", "At Risk", "Delayed"],
+                "range": ["#2e7d32", "#d97706", "#c62828"]
+            }
+        },
+        "tooltip": [
+            { "field": "Status", "type": "nominal" },
+            { "field": "ProjectCount", "type": "quantitative" }
+        ]
+    }
+}

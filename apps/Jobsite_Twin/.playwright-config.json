@@ -1,0 +1,13 @@
+{
+    "browser": {
+        "browserName": "chromium",
+        "launchOptions": {
+            "headless": false,
+            "args": [
+                "--disable-features=BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessRespectPreflightResults,LocalNetworkAccessChecks",
+                "--window-position=120,90",
+                "--window-size=1440,940"
+            ]
+        }
+    }
+}

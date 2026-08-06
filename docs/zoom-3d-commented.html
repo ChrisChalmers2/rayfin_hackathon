@@ -1,0 +1,1333 @@
+<!doctype html>
+<html lang="en-US" dir="ltr">
+<!--
+  ============================================================================
+  ANNOTATED REFERENCE BUILD — 3D BAR CHART (render · tilt · zoom · filter)
+  ============================================================================
+  This is a single-file, dependency-free interactive 3D bar chart. It uses NO
+  WebGL / three.js — the entire 3D scene is hand-rolled on a plain 2D <canvas>
+  by projecting 3D points to 2D with a small rotation + perspective transform
+  and painting cuboids back-to-front (the "painter's algorithm").
+
+  The four features called out for reuse live here:
+
+    1. 3D RENDER  → rotatePoint(), project(), barGeometry(), render(), drawGround()
+                    Data point (year, territory, value) → 3D coordinate → 2D pixel.
+                    Bars are 8-vertex cuboids; each of the 5 visible faces is a
+                    filled polygon, depth-sorted so nearer bars paint last.
+
+    2. TILT       → state: rotationX (pitch) + rotationY (yaw); applied in rotatePoint().
+                    Driven by pointer drag (pointermove) and Arrow keys (keydown).
+                    Pitch is clamped to [minPitch, maxPitch] so the scene never flips.
+
+    3. ZOOM       → state: `zoom` (pixels-per-world-unit); applied in project().
+                    Driven by mouse wheel (wheel) and +/- keys, clamped to [38, 96].
+
+    4. FILTER     → state: `activeFilter`; applied in visibleRecords().
+                    A <select> dropdown narrows which records are drawn; the table
+                    below and the status line stay in sync.
+
+  RENDER LOOP: there is no requestAnimationFrame loop. Every interaction mutates
+  state (rotation/zoom/filter/selection) and then calls resizeCanvas(), which
+  re-derives pixel dimensions and calls render() once. This "redraw on change"
+  model is cheap here because the scene is tiny (≤56 bars).
+
+  PORTING NOTE: to drop these features into another app, lift the pure-math core
+  (rotatePoint, project, barGeometry) plus the interaction handlers, and feed it
+  any array of {x-category, z-category, value} records. Nothing below is specific
+  to Australia except the `records` array and the axis labels.
+  ============================================================================
+-->
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>3D Year-over-Year Unit Change — Australia</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --page: #f4f7fb;
+      --surface: #ffffff;
+      --surface-alt: #eef4fa;
+      --text: #172033;
+      --muted: #5d6b82;
+      --border: #cbd6e2;
+      --accent: #0f6cbd;
+      --accent-hover: #0a4f8a;
+      --shadow: 0 16px 40px rgba(24, 46, 77, 0.12);
+      --focus: #ffb900;
+      --good: #087a4b;
+      --bad: #b42318;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-block-size: 100vh;
+      background: linear-gradient(145deg, var(--page), #e9f1fa);
+      color: var(--text);
+      font-family: "Segoe UI", Arial, sans-serif;
+      line-height: 1.45;
+    }
+
+    main {
+      inline-size: min(1440px, calc(100% - 32px));
+      margin-inline: auto;
+      padding-block: 28px 42px;
+    }
+
+    header {
+      margin-block-end: 18px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(1.7rem, 3vw, 2.6rem);
+      letter-spacing: -0.025em;
+    }
+
+    .subtitle {
+      margin-block: 7px 0;
+      color: var(--muted);
+      max-inline-size: 950px;
+    }
+
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: end;
+      gap: 12px;
+      padding: 16px;
+      background: var(--surface-alt);
+      border-block-end: 1px solid var(--border);
+    }
+
+    .field {
+      display: grid;
+      gap: 5px;
+      min-inline-size: 260px;
+    }
+
+    label {
+      font-weight: 700;
+      font-size: 0.86rem;
+      color: var(--muted);
+    }
+
+    select,
+    button {
+      min-block-size: 42px;
+      border-radius: 9px;
+      border: 1px solid var(--border);
+      font: inherit;
+    }
+
+    select {
+      padding-inline: 11px 34px;
+      background: var(--surface);
+      color: var(--text);
+    }
+
+    button {
+      cursor: pointer;
+      padding-inline: 16px;
+      background: var(--accent);
+      color: #ffffff;
+      border-color: var(--accent);
+      font-weight: 700;
+    }
+
+    button:hover {
+      background: var(--accent-hover);
+      border-color: var(--accent-hover);
+    }
+
+    select:focus-visible,
+    button:focus-visible,
+    canvas:focus-visible {
+      outline: 3px solid var(--focus);
+      outline-offset: 2px;
+    }
+
+    .status {
+      margin-inline-start: auto;
+      padding: 9px 12px;
+      border-radius: 9px;
+      color: var(--muted);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      font-size: 0.9rem;
+    }
+
+    /* .stage is the positioning context for the canvas + floating overlays
+       (tooltip and legend are absolutely positioned against it). The canvas
+       itself is the only pixel-drawn surface; everything else is normal DOM. */
+    .stage {
+      position: relative;
+      min-block-size: 620px;
+      background:
+        radial-gradient(circle at 50% 15%, rgba(15, 108, 189, 0.09), transparent 42%),
+        var(--surface);
+    }
+
+    /* touch-action: none is REQUIRED for the drag-to-tilt gesture: it stops the
+       browser from hijacking touch/pen drags for scrolling/panning so our
+       pointermove handler receives every move. cursor: grab -> grabbing signals
+       the rotate affordance. */
+    canvas {
+      display: block;
+      inline-size: 100%;
+      block-size: 620px;
+      cursor: grab;
+      touch-action: none;
+    }
+
+    canvas.dragging {
+      cursor: grabbing;
+    }
+
+    .tooltip {
+      position: absolute;
+      z-index: 5;
+      pointer-events: none;
+      min-inline-size: 225px;
+      padding: 11px 12px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: rgba(20, 29, 45, 0.96);
+      color: #ffffff;
+      box-shadow: 0 10px 28px rgba(0, 0, 0, 0.22);
+      opacity: 0;
+      transform: translateY(5px);
+      transition: opacity 120ms ease, transform 120ms ease;
+    }
+
+    .tooltip.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    .tooltip strong {
+      display: block;
+      margin-block-end: 4px;
+    }
+
+    .tooltip-grid {
+      display: grid;
+      grid-template-columns: auto auto;
+      gap: 2px 14px;
+      font-size: 0.87rem;
+    }
+
+    .tooltip-grid span:nth-child(odd) {
+      color: #cbd7e8;
+    }
+
+    .legend {
+      position: absolute;
+      inset-block-start: 16px;
+      inset-inline-end: 16px;
+      inline-size: min(250px, calc(100% - 32px));
+      padding: 11px 12px;
+      border-radius: 11px;
+      background: rgba(255, 255, 255, 0.92);
+      border: 1px solid var(--border);
+      color: #172033;
+      box-shadow: 0 8px 24px rgba(24, 46, 77, 0.12);
+      backdrop-filter: blur(6px);
+    }
+
+    .legend-title {
+      font-size: 0.83rem;
+      font-weight: 800;
+      margin-block-end: 7px;
+    }
+
+    .gradient {
+      block-size: 12px;
+      border-radius: 999px;
+      background: linear-gradient(90deg, #b42318, #f7f8fa 22%, #f7f8fa 38%, #087a4b);
+      border: 1px solid #9ca9b9;
+    }
+
+    .legend-scale {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      margin-block-start: 4px;
+      color: #42526a;
+      font-size: 0.73rem;
+    }
+
+    .instructions {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      padding: 14px 16px 16px;
+      border-block-start: 1px solid var(--border);
+      background: var(--surface-alt);
+    }
+
+    .instruction {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    .instruction b {
+      color: var(--text);
+    }
+
+    .icon {
+      display: grid;
+      place-items: center;
+      flex: 0 0 32px;
+      block-size: 32px;
+      border-radius: 50%;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--accent);
+      font-weight: 800;
+    }
+
+    .table-section {
+      margin-block-start: 24px;
+    }
+
+    h2 {
+      margin-block: 0 8px;
+      font-size: 1.25rem;
+    }
+
+    .table-note,
+    .source {
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    .table-wrap {
+      overflow: auto;
+      margin-block-start: 12px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--surface);
+    }
+
+    table {
+      inline-size: 100%;
+      min-inline-size: 900px;
+      border-collapse: collapse;
+    }
+
+    th,
+    td {
+      padding: 10px 12px;
+      border-block-end: 1px solid var(--border);
+      text-align: center;
+      white-space: nowrap;
+    }
+
+    th {
+      position: sticky;
+      inset-block-start: 0;
+      z-index: 1;
+      background: #dce9f5;
+      color: #172033;
+      font-size: 0.83rem;
+    }
+
+    th:first-child,
+    td:first-child {
+      position: sticky;
+      inset-inline-start: 0;
+      text-align: start;
+      background: var(--surface);
+      font-weight: 700;
+      box-shadow: 1px 0 var(--border);
+    }
+
+    th:first-child {
+      background: #dce9f5;
+    }
+
+    td.positive {
+      color: #075f3a;
+      background: rgba(8, 122, 75, var(--heat, 0.08));
+    }
+
+    td.negative {
+      color: #9f2016;
+      background: rgba(180, 35, 24, var(--heat, 0.1));
+    }
+
+    .source {
+      margin-block: 14px 0;
+    }
+
+    .sr-only {
+      position: absolute;
+      inline-size: 1px;
+      block-size: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+
+    @media (max-width: 760px) {
+      main {
+        inline-size: min(100% - 16px, 1440px);
+        padding-block-start: 14px;
+      }
+
+      .stage {
+        min-block-size: 540px;
+      }
+
+      canvas {
+        block-size: 540px;
+      }
+
+      .legend {
+        inset-block-start: auto;
+        inset-block-end: 12px;
+      }
+
+      .instructions {
+        grid-template-columns: 1fr;
+      }
+
+      .status {
+        inline-size: 100%;
+        margin-inline-start: 0;
+      }
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        color-scheme: dark;
+        --page: #101723;
+        --surface: #172131;
+        --surface-alt: #202c3d;
+        --text: #f2f6fb;
+        --muted: #b4c0cf;
+        --border: #405068;
+        --accent: #4da3e6;
+        --accent-hover: #70b8ee;
+        --shadow: 0 16px 40px rgba(0, 0, 0, 0.3);
+      }
+
+      body {
+        background: linear-gradient(145deg, var(--page), #17263a);
+      }
+
+      th,
+      th:first-child {
+        background: #2a3c53;
+        color: #f2f6fb;
+      }
+
+      td.positive {
+        color: #9ae2bf;
+      }
+
+      td.negative {
+        color: #ffaaa3;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .tooltip {
+        transition: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>3D Year-over-Year Unit Change — Australia</h1>
+      <p class="subtitle">Explore how annual unit growth changed across each Australian state and territory. Positive bars rise above the zero plane; declines extend below it.</p>
+    </header>
+
+    <section class="panel" aria-labelledby="visualization-heading">
+      <h2 id="visualization-heading" class="sr-only">Interactive 3D visualization</h2>
+      <!-- FILTER UI: the <select> starts with only the "All" option in markup;
+           JS appends one <option> per territory at startup. Changing it sets
+           `activeFilter`, which visibleRecords() reads to decide what to draw.
+           The "Reset view" button restores default tilt/zoom/selection. -->
+      <div class="toolbar">
+        <div class="field">
+          <label for="territory-filter">Territory filter</label>
+          <select id="territory-filter">
+            <option value="All">All states and territories</option>
+          </select>
+        </div>
+        <button id="reset-button" type="button">Reset view</button>
+        <div id="status" class="status" role="status" aria-live="polite">Showing all 56 annual changes</div>
+      </div>
+
+      <!-- The canvas is focusable (tabindex="0") so keyboard users can tilt/zoom
+           it with Arrow and +/- keys. aria-label + the accessible data table
+           further down provide a non-visual equivalent of the 3D scene. -->
+      <div id="stage" class="stage">
+        <canvas id="chart" tabindex="0" aria-label="Interactive 3D bar chart of year-over-year percentage change in units sold by Australian territory and year"></canvas>
+        <div id="tooltip" class="tooltip" role="tooltip"></div>
+        <div class="legend" aria-label="Color legend">
+          <div class="legend-title">Percentage change</div>
+          <div class="gradient"></div>
+          <div class="legend-scale">
+            <span>Largest decline −8.2%</span>
+            <span>Zero</span>
+            <span>Largest increase +45.7%</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="instructions" aria-label="Visualization controls">
+        <div class="instruction"><span class="icon" aria-hidden="true">↔</span><span><b>Rotate:</b> drag across the chart</span></div>
+        <div class="instruction"><span class="icon" aria-hidden="true">＋</span><span><b>Zoom:</b> use the mouse wheel</span></div>
+        <div class="instruction"><span class="icon" aria-hidden="true">●</span><span><b>Focus:</b> click a bar to dim the others</span></div>
+      </div>
+    </section>
+
+    <section class="table-section" aria-labelledby="table-heading">
+      <h2 id="table-heading">Accessible data table</h2>
+      <p class="table-note">Cells use the same red-to-green scale as the 3D visualization. Values compare each year with the prior year.</p>
+      <div class="table-wrap">
+        <table id="data-table">
+          <caption class="sr-only">Year-over-year percentage change in units sold by Australian state or territory, 2015 through 2021</caption>
+        </table>
+      </div>
+      <p class="source">Source: DIAD Final Report Power BI semantic model. Percentage change compares each year with the prior year.</p>
+    </section>
+  </main>
+
+  <script>
+    (() => {
+      "use strict";
+
+      // -----------------------------------------------------------------------
+      // DATA MODEL
+      // Each raw row is [territory, year, currentUnits, priorUnits, changeRatio].
+      // `change` is the fraction (e.g. 0.192 = +19.2%) that drives BOTH the bar
+      // height (via heightScale) and its color. The trailing .map() below turns
+      // each array into an object and adds a stable `key` = "territory|year" used
+      // for hover/selection identity. To reuse this chart elsewhere, replace only
+      // this array — every downstream axis, color, and label derives from it.
+      // -----------------------------------------------------------------------
+      const records = [
+        ["Australian Capital Territory", 2015, 2384, 2000, 0.192],
+        ["Australian Capital Territory", 2016, 3473, 2384, 0.45679530201342283],
+        ["Australian Capital Territory", 2017, 3501, 3473, 0.00806219406852865],
+        ["Australian Capital Territory", 2018, 3538, 3501, 0.010568409025992574],
+        ["Australian Capital Territory", 2019, 3522, 3538, -0.0045223289994347085],
+        ["Australian Capital Territory", 2020, 3794, 3522, 0.07722884724588303],
+        ["Australian Capital Territory", 2021, 4111, 3794, 0.08355297838692673],
+        ["New South Wales", 2015, 63726, 51594, 0.23514362135131991],
+        ["New South Wales", 2016, 78905, 63726, 0.23819163292847503],
+        ["New South Wales", 2017, 84800, 78905, 0.07471009441733731],
+        ["New South Wales", 2018, 86659, 84800, 0.021922169811320755],
+        ["New South Wales", 2019, 91240, 86659, 0.052862368594144865],
+        ["New South Wales", 2020, 89327, 91240, -0.02096668128014029],
+        ["New South Wales", 2021, 98324, 89327, 0.10071982715192496],
+        ["Northern Territory", 2015, 3904, 3489, 0.11894525652049298],
+        ["Northern Territory", 2016, 4895, 3904, 0.2538422131147541],
+        ["Northern Territory", 2017, 4709, 4895, -0.037997957099080694],
+        ["Northern Territory", 2018, 5100, 4709, 0.08303249097472924],
+        ["Northern Territory", 2019, 5063, 5100, -0.0072549019607843135],
+        ["Northern Territory", 2020, 5027, 5063, -0.00711040884850879],
+        ["Northern Territory", 2021, 5686, 5027, 0.13109210264571314],
+        ["Queensland", 2015, 30353, 23419, 0.2960843759340706],
+        ["Queensland", 2016, 37635, 30353, 0.23991038777056634],
+        ["Queensland", 2017, 40349, 37635, 0.07211372392719544],
+        ["Queensland", 2018, 40466, 40349, 0.0028997001164836798],
+        ["Queensland", 2019, 44658, 40466, 0.10359313991993278],
+        ["Queensland", 2020, 43838, 44658, -0.018361771687043754],
+        ["Queensland", 2021, 48493, 43838, 0.10618641361375976],
+        ["South Australia", 2015, 22698, 17698, 0.28251779862131315],
+        ["South Australia", 2016, 27133, 22698, 0.1953916644638294],
+        ["South Australia", 2017, 30047, 27133, 0.10739689676777356],
+        ["South Australia", 2018, 31627, 30047, 0.052584284620760806],
+        ["South Australia", 2019, 33166, 31627, 0.0486609542479527],
+        ["South Australia", 2020, 32208, 33166, -0.028885002713622383],
+        ["South Australia", 2021, 35991, 32208, 0.11745529061102832],
+        ["Tasmania", 2015, 6403, 5093, 0.25721578637345377],
+        ["Tasmania", 2016, 7946, 6403, 0.24098079025456817],
+        ["Tasmania", 2017, 8864, 7946, 0.11552982632771205],
+        ["Tasmania", 2018, 8996, 8864, 0.014891696750902527],
+        ["Tasmania", 2019, 9378, 8996, 0.04246331702979102],
+        ["Tasmania", 2020, 8610, 9378, -0.0818937939859245],
+        ["Tasmania", 2021, 9647, 8610, 0.12044134727061556],
+        ["Victoria", 2015, 52149, 39514, 0.3197600850331528],
+        ["Victoria", 2016, 62576, 52149, 0.1999463076952578],
+        ["Victoria", 2017, 68247, 62576, 0.09062579902838148],
+        ["Victoria", 2018, 70465, 68247, 0.032499597051885064],
+        ["Victoria", 2019, 74911, 70465, 0.06309515362236572],
+        ["Victoria", 2020, 72094, 74911, -0.037604624153996076],
+        ["Victoria", 2021, 80107, 72094, 0.11114655865952784],
+        ["Western Australia", 2015, 22563, 18020, 0.2521087680355161],
+        ["Western Australia", 2016, 26878, 22563, 0.19124229933962683],
+        ["Western Australia", 2017, 29903, 26878, 0.11254557630776099],
+        ["Western Australia", 2018, 30514, 29903, 0.020432732501755677],
+        ["Western Australia", 2019, 30982, 30514, 0.01533722225863538],
+        ["Western Australia", 2020, 30535, 30982, -0.014427732231618359],
+        ["Western Australia", 2021, 33574, 30535, 0.09952513509087932]
+      ].map(([territory, year, current, prior, change]) => ({
+        territory,
+        year,
+        current,
+        prior,
+        change,
+        key: `${territory}|${year}` // unique id for hover/select/tooltip lookups
+      }));
+
+      // Unique category axes derived from the data. `years` becomes the X axis,
+      // `territories` becomes the Z axis (depth). Their COUNT and ORDER decide the
+      // grid layout, so anything reading these stays automatically in sync.
+      const years = [...new Set(records.map((record) => record.year))];
+      const territories = [...new Set(records.map((record) => record.territory))];
+      const abbreviations = {
+        "Australian Capital Territory": "ACT",
+        "New South Wales": "NSW",
+        "Northern Territory": "NT",
+        "Queensland": "QLD",
+        "South Australia": "SA",
+        "Tasmania": "TAS",
+        "Victoria": "VIC",
+        "Western Australia": "WA"
+      };
+
+      // Cache DOM handles once. `context` is the 2D drawing context — the single
+      // surface all 3D output is rasterized onto.
+      const canvas = document.getElementById("chart");
+      const context = canvas.getContext("2d");
+      const stage = document.getElementById("stage");
+      const tooltip = document.getElementById("tooltip");
+      const filter = document.getElementById("territory-filter");
+      const resetButton = document.getElementById("reset-button");
+      const status = document.getElementById("status");
+
+      // FILTER: populate the dropdown with one option per territory (the "All"
+      // option already exists in the HTML). Selecting one sets `activeFilter`.
+      territories.forEach((territory) => {
+        const option = document.createElement("option");
+        option.value = territory;
+        option.textContent = territory;
+        filter.appendChild(option);
+      });
+
+      // -----------------------------------------------------------------------
+      // 3D SCENE CONSTANTS (all in abstract "world units", not pixels)
+      // maxPositive / minNegative: data extremes → normalize color + axis ticks.
+      // barWidth / barDepth: footprint of each cuboid on the X (year) / Z
+      //   (territory) axes; < the spacings so bars don't touch.
+      // xSpacing / zSpacing: gap between grid cells along X and Z.
+      // heightScale: world-units of bar height per 1.0 of change (0.192 -> 1.80).
+      // cameraDistance: viewer distance used for the perspective divide in
+      //   project(); larger = flatter/weaker perspective, smaller = more extreme.
+      // minPitch / maxPitch: clamp for the TILT pitch (rotationX) in radians so
+      //   the camera can't tumble past straight-down / straight-up (~±66°).
+      // -----------------------------------------------------------------------
+      const maxPositive = Math.max(...records.map((record) => record.change));
+      const minNegative = Math.min(...records.map((record) => record.change));
+      const barWidth = 0.68;
+      const barDepth = 0.58;
+      const xSpacing = 1.28;
+      const zSpacing = 0.92;
+      const heightScale = 9.4;
+      const cameraDistance = 18;
+      const minPitch = -1.15;
+      const maxPitch = 1.15;
+
+      // -----------------------------------------------------------------------
+      // MUTABLE VIEW STATE — every interaction changes one of these, then calls
+      // resizeCanvas()/render() to repaint. This is the whole "engine".
+      //   rotationY  → TILT yaw   (spin left/right), radians. Default faces scene.
+      //   rotationX  → TILT pitch (lean up/down),   radians, clamped to min/max.
+      //   zoom       → ZOOM factor: world-units → pixels in project(). [38..96].
+      //   selectedKey→ clicked bar (others dim); null = none focused.
+      //   hoverKey   → bar currently under the cursor (outline highlight).
+      //   activeFilter→ FILTER value ("All" or a territory name).
+      //   hitAreas   → per-frame list of projected bar polygons for click/hover
+      //                hit-testing (rebuilt every render since geometry moves).
+      //   pointerDown/dragged/pointerStart/previousPointer → drag-gesture bookkeeping
+      //                used to distinguish a rotate-drag from a click-to-select.
+      // -----------------------------------------------------------------------
+      let rotationY = -0.72;
+      let rotationX = 0.52;
+      let zoom = 60;
+      let selectedKey = null;
+      let hoverKey = null;
+      let activeFilter = "All";
+      let hitAreas = [];
+      let pointerDown = false;
+      let dragged = false;
+      let pointerStart = { x: 0, y: 0 };
+      let previousPointer = { x: 0, y: 0 };
+
+      const numberFormatter = new Intl.NumberFormat("en-US");
+      const percentFormatter = new Intl.NumberFormat("en-US", {
+        style: "percent",
+        minimumFractionDigits: 1,
+        maximumFractionDigits: 1,
+        signDisplay: "always"
+      });
+
+      // --- COLOR RAMP --------------------------------------------------------
+      // mix(): linear interpolation between two [r,g,b] arrays (0..1 amount).
+      // colorForValue(): maps a change ratio to a diverging red→neutral→green
+      //   ramp, normalized against the data's own min/max so full saturation ==
+      //   the biggest decline / biggest gain in THIS dataset.
+      // shade(): multiply an rgb by a factor to fake per-face lighting (top face
+      //   brightest, sides darker) — this is what makes flat polygons read as 3D.
+      // rgba(): serialize [r,g,b] + alpha to a CSS color string.
+      function mix(start, end, amount) {
+        return start.map((value, index) => Math.round(value + (end[index] - value) * amount));
+      }
+
+      function colorForValue(value) {
+        const neutral = [237, 242, 247];
+        if (value < 0) {
+          const ratio = Math.min(1, Math.abs(value / minNegative));
+          return mix(neutral, [180, 35, 24], ratio);
+        }
+        const ratio = Math.min(1, value / maxPositive);
+        return mix(neutral, [8, 122, 75], ratio);
+      }
+
+      function shade(rgb, factor) {
+        return rgb.map((value) => Math.max(0, Math.min(255, Math.round(value * factor))));
+      }
+
+      function rgba(rgb, alpha) {
+        return `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, ${alpha})`;
+      }
+
+      // === TILT (rotation) ====================================================
+      // Rotate a 3D world point by the current yaw (rotationY) then pitch
+      // (rotationX). This is the ENTIRE tilt implementation — two chained 2D
+      // rotations, no matrix library needed:
+      //   1. Yaw about the vertical Y axis: spins the scene left/right in the
+      //      X–Z (ground) plane.  (x1, z1) are the yaw-rotated horizontal coords.
+      //   2. Pitch about the horizontal X axis: leans the scene toward/away from
+      //      the viewer in the Y–Z plane.
+      // Because rotationX/rotationY are just numbers, dragging or pressing arrows
+      // updates them and the next render redraws from this transform. To reuse:
+      // copy this function verbatim; it depends only on the two rotation globals.
+      function rotatePoint(point) {
+        const cosY = Math.cos(rotationY);
+        const sinY = Math.sin(rotationY);
+        const x1 = point.x * cosY - point.z * sinY;   // yaw: rotate X–Z plane
+        const z1 = point.x * sinY + point.z * cosY;
+
+        const cosX = Math.cos(rotationX);
+        const sinX = Math.sin(rotationX);
+        return {
+          x: x1,                                        // X unaffected by pitch
+          y: point.y * cosX - z1 * sinX,                // pitch: rotate Y–Z plane
+          z: point.y * sinX + z1 * cosX
+        };
+      }
+
+      // === 3D RENDER core + ZOOM ==============================================
+      // project(): the pinhole-camera step that turns a rotated 3D point into a
+      // 2D canvas pixel. This is where 3D RENDER and ZOOM both live.
+      //   perspective: the "divide by depth" that makes far things smaller.
+      //     Points with larger rotated.z are further away → smaller perspective →
+      //     pulled toward the vanishing point. cameraDistance tunes how strong
+      //     that falloff is.
+      //   zoom: scales world-units to pixels (bigger = closer). Multiplying by
+      //     `perspective` too means near bars zoom faster than far ones — correct
+      //     perspective behavior.
+      //   width*0.49 / height*0.57: screen-space origin (slightly left & below
+      //     center) so the chart sits nicely in frame.
+      //   y is SUBTRACTED because canvas Y grows downward but world Y grows up.
+      //   depth (rotated.z) is returned so render() can sort faces back-to-front.
+      function project(point, width, height) {
+        const rotated = rotatePoint(point);                            // apply TILT
+        const perspective = cameraDistance / (cameraDistance + rotated.z);
+        return {
+          x: width * 0.49 + rotated.x * zoom * perspective,            // apply ZOOM (x)
+          y: height * 0.57 - rotated.y * zoom * perspective,           // apply ZOOM (y), flip axis
+          depth: rotated.z,                                            // for painter's sort
+          perspective
+        };
+      }
+
+      // Size the canvas backing store to its CSS box × devicePixelRatio (capped
+      // at 2 to bound cost) so lines stay crisp on HiDPI screens, then scale the
+      // context so all drawing code can use plain CSS pixels. Ends by calling
+      // render() — so throughout the app "repaint" == "resizeCanvas()".
+      function resizeCanvas() {
+        const ratio = Math.min(window.devicePixelRatio || 1, 2);
+        const bounds = canvas.getBoundingClientRect();
+        const width = Math.max(640, Math.round(bounds.width));
+        const height = Math.max(460, Math.round(bounds.height));
+        canvas.width = Math.round(width * ratio);
+        canvas.height = Math.round(height * ratio);
+        context.setTransform(ratio, 0, 0, ratio, 0, 0);
+        render(width, height);
+      }
+
+      // Fill + stroke a closed polygon from an array of {x,y} points. Every 3D
+      // face, the ground plane, and the grid are drawn through this one helper.
+      function polygon(context2d, points, fillStyle, strokeStyle, lineWidth = 0.8) {
+        context2d.beginPath();
+        points.forEach((point, index) => {
+          if (index === 0) {
+            context2d.moveTo(point.x, point.y);
+          } else {
+            context2d.lineTo(point.x, point.y);
+          }
+        });
+        context2d.closePath();
+        context2d.fillStyle = fillStyle;
+        context2d.fill();
+        context2d.strokeStyle = strokeStyle;
+        context2d.lineWidth = lineWidth;
+        context2d.stroke();
+      }
+
+      // === FILTER =============================================================
+      // Single source of truth for "what is currently drawn". render(), the
+      // status line, and the reset logic all call this. When `activeFilter` is a
+      // territory, only its 7 yearly bars survive; "All" returns everything.
+      function visibleRecords() {
+        return activeFilter === "All"
+          ? records
+          : records.filter((record) => record.territory === activeFilter);
+      }
+
+      // === 3D RENDER: floor, grid & axes =====================================
+      // Draws the reference ground plane (a projected quad), the year/territory
+      // grid lines, the category labels, and the emphasized zero line. Everything
+      // is built from project()ed world points, so it tilts/zooms with the bars.
+      // Note it centers the grid on the origin: indices are shifted by
+      // (count-1)/2 so the whole chart is symmetric around (0,0,0).
+      function drawGround(width, height) {
+        const xMin = -(years.length - 1) * xSpacing / 2 - 0.75;
+        const xMax = -xMin;
+        const zMin = -(territories.length - 1) * zSpacing / 2 - 0.55;
+        const zMax = -zMin;
+        const corners = [
+          project({ x: xMin, y: 0, z: zMin }, width, height),
+          project({ x: xMax, y: 0, z: zMin }, width, height),
+          project({ x: xMax, y: 0, z: zMax }, width, height),
+          project({ x: xMin, y: 0, z: zMax }, width, height)
+        ];
+
+        polygon(context, corners, "rgba(207, 220, 234, 0.20)", "rgba(87, 110, 138, 0.55)", 1.1);
+
+        context.lineWidth = 0.7;
+        context.strokeStyle = "rgba(104, 125, 150, 0.34)";
+        years.forEach((year, index) => {
+          const x = (index - (years.length - 1) / 2) * xSpacing;
+          const start = project({ x, y: 0, z: zMin }, width, height);
+          const end = project({ x, y: 0, z: zMax }, width, height);
+          context.beginPath();
+          context.moveTo(start.x, start.y);
+          context.lineTo(end.x, end.y);
+          context.stroke();
+        });
+
+        territories.forEach((territory, index) => {
+          const z = (index - (territories.length - 1) / 2) * zSpacing;
+          const start = project({ x: xMin, y: 0, z }, width, height);
+          const end = project({ x: xMax, y: 0, z }, width, height);
+          context.beginPath();
+          context.moveTo(start.x, start.y);
+          context.lineTo(end.x, end.y);
+          context.stroke();
+        });
+
+        context.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--muted").trim();
+        context.font = "600 12px Segoe UI, Arial, sans-serif";
+        context.textAlign = "center";
+        years.forEach((year, index) => {
+          const x = (index - (years.length - 1) / 2) * xSpacing;
+          const labelPoint = project({ x, y: 0, z: zMin - 0.48 }, width, height);
+          context.fillText(String(year), labelPoint.x, labelPoint.y + 5);
+        });
+
+        context.textAlign = "start";
+        territories.forEach((territory, index) => {
+          if (activeFilter !== "All" && territory !== activeFilter) {
+            return;
+          }
+          const z = (index - (territories.length - 1) / 2) * zSpacing;
+          const labelPoint = project({ x: xMin - 0.75, y: 0, z }, width, height);
+          context.fillText(abbreviations[territory], labelPoint.x - 4, labelPoint.y + 4);
+        });
+
+        const zeroA = project({ x: xMin, y: 0, z: zMin }, width, height);
+        const zeroB = project({ x: xMin, y: 0, z: zMax }, width, height);
+        context.strokeStyle = "rgba(23, 32, 51, 0.72)";
+        context.lineWidth = 1.7;
+        context.beginPath();
+        context.moveTo(zeroA.x, zeroA.y);
+        context.lineTo(zeroB.x, zeroB.y);
+        context.stroke();
+      }
+
+      // === 3D RENDER: one bar → a cuboid =====================================
+      // Turn a single record into a drawable 3D box:
+      //   • center (centerX, centerZ) from its year/territory grid position.
+      //   • height from change * heightScale; a NEGATIVE change makes the box
+      //     hang BELOW the zero plane (yLow<0), a positive one rises above it.
+      //   • 8 vertices (bottom face 0-3, top face 4-7) are each project()ed to 2D.
+      //   • faceIndexes lists the 4 side faces plus ONE cap: the top cap [4,5,6,7]
+      //     for gains, the bottom cap [0,1,2,3] for losses (the hidden cap is
+      //     skipped — a cheap back-face cull). Each face also carries its mean
+      //     depth so render() can paint a bar's own faces back-to-front.
+      //   • the bar's overall `depth` (mean of all 8 vertices) orders bars
+      //     against each other.
+      function barGeometry(record, width, height) {
+        const xIndex = years.indexOf(record.year);
+        const zIndex = territories.indexOf(record.territory);
+        const centerX = (xIndex - (years.length - 1) / 2) * xSpacing;
+        const centerZ = (zIndex - (territories.length - 1) / 2) * zSpacing;
+        const yTop = record.change * heightScale;
+        const yLow = Math.min(0, yTop);
+        const yHigh = Math.max(0, yTop);
+        const x0 = centerX - barWidth / 2;
+        const x1 = centerX + barWidth / 2;
+        const z0 = centerZ - barDepth / 2;
+        const z1 = centerZ + barDepth / 2;
+        const vertices = [
+          { x: x0, y: yLow, z: z0 },
+          { x: x1, y: yLow, z: z0 },
+          { x: x1, y: yLow, z: z1 },
+          { x: x0, y: yLow, z: z1 },
+          { x: x0, y: yHigh, z: z0 },
+          { x: x1, y: yHigh, z: z0 },
+          { x: x1, y: yHigh, z: z1 },
+          { x: x0, y: yHigh, z: z1 }
+        ].map((point) => project(point, width, height));
+
+        const faceIndexes = [
+          [0, 1, 5, 4],
+          [1, 2, 6, 5],
+          [2, 3, 7, 6],
+          [3, 0, 4, 7],
+          record.change >= 0 ? [4, 5, 6, 7] : [0, 1, 2, 3]
+        ];
+
+        const faces = faceIndexes.map((indexes, faceIndex) => {
+          const points = indexes.map((index) => vertices[index]);
+          return {
+            points,
+            faceIndex,
+            depth: points.reduce((sum, point) => sum + point.depth, 0) / points.length
+          };
+        });
+
+        const depth = vertices.reduce((sum, point) => sum + point.depth, 0) / vertices.length;
+        return { record, vertices, faces, depth };
+      }
+
+      // === 3D RENDER: the frame ==============================================
+      // The single repaint function. Sequence:
+      //   1. Clear the canvas and reset hitAreas (rebuilt every frame because the
+      //      projected polygons move whenever tilt/zoom/filter change).
+      //   2. Draw the ground/grid first (furthest visual layer).
+      //   3. Build cuboids only for the FILTERED records, then PAINTER'S
+      //      ALGORITHM: sort bars far→near (descending depth) so nearer bars
+      //      overpaint farther ones — this fakes occlusion with no z-buffer.
+      //   4. For each bar: pick its data color, apply selection dimming (focused
+      //      bar stays opaque, others drop to alpha 0.13), sort its own faces
+      //      far→near, shade each face by faceFactors[] for a lit look, and push
+      //      its polygons into hitAreas for click/hover testing.
+      //   5. Finally draw the vertical value axis and its % tick labels.
+      function render(width, height) {
+        context.clearRect(0, 0, width, height);
+        hitAreas = [];
+        drawGround(width, height);
+
+        const bars = visibleRecords()                                  // FILTER applied here
+          .map((record) => barGeometry(record, width, height))
+          .sort((a, b) => b.depth - a.depth);                          // painter's algorithm
+
+        bars.forEach((bar) => {
+          const baseColor = colorForValue(bar.record.change);
+          const isSelected = selectedKey === bar.record.key;
+          const isHovered = hoverKey === bar.record.key;
+          const dimmed = selectedKey !== null && !isSelected;
+          const alpha = dimmed ? 0.13 : 0.94;
+          const faceFactors = [0.72, 0.82, 0.63, 0.9, 1.05];
+
+          bar.faces
+            .slice()
+            .sort((a, b) => b.depth - a.depth)
+            .forEach((face) => {
+              const faceColor = shade(baseColor, faceFactors[face.faceIndex]);
+              polygon(
+                context,
+                face.points,
+                rgba(faceColor, alpha),
+                isSelected || isHovered ? "rgba(10, 38, 65, 0.96)" : "rgba(45, 64, 86, 0.48)",
+                isSelected || isHovered ? 2.1 : 0.7
+              );
+            });
+
+          hitAreas.push({
+            key: bar.record.key,
+            record: bar.record,
+            polygons: bar.faces.map((face) => face.points),
+            depth: bar.depth
+          });
+        });
+
+        const axisStart = project({
+          x: -(years.length - 1) * xSpacing / 2 - 0.75,
+          y: minNegative * heightScale,
+          z: -(territories.length - 1) * zSpacing / 2 - 0.55
+        }, width, height);
+        const axisEnd = project({
+          x: -(years.length - 1) * xSpacing / 2 - 0.75,
+          y: maxPositive * heightScale,
+          z: -(territories.length - 1) * zSpacing / 2 - 0.55
+        }, width, height);
+
+        context.strokeStyle = "rgba(45, 64, 86, 0.78)";
+        context.lineWidth = 1.4;
+        context.beginPath();
+        context.moveTo(axisStart.x, axisStart.y);
+        context.lineTo(axisEnd.x, axisEnd.y);
+        context.stroke();
+
+        context.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--muted").trim();
+        context.font = "700 11px Segoe UI, Arial, sans-serif";
+        context.textAlign = "end";
+        [-0.08, 0, 0.1, 0.2, 0.3, 0.4].forEach((tick) => {
+          const point = project({
+            x: -(years.length - 1) * xSpacing / 2 - 0.75,
+            y: tick * heightScale,
+            z: -(territories.length - 1) * zSpacing / 2 - 0.55
+          }, width, height);
+          context.fillText(`${Math.round(tick * 100)}%`, point.x - 6, point.y + 4);
+        });
+      }
+
+      // === PICKING (hover/click hit-testing) =================================
+      // Because bars are drawn as flat 2D polygons, "which bar is under the
+      // cursor?" is a 2D point-in-polygon test — the classic ray-casting /
+      // even-odd rule: count edge crossings of a ray going right from (x,y);
+      // odd = inside. (yj - yi || EPSILON) guards against divide-by-zero on
+      // horizontal edges.
+      function pointInPolygon(x, y, polygonPoints) {
+        let inside = false;
+        for (let i = 0, j = polygonPoints.length - 1; i < polygonPoints.length; j = i++) {
+          const xi = polygonPoints[i].x;
+          const yi = polygonPoints[i].y;
+          const xj = polygonPoints[j].x;
+          const yj = polygonPoints[j].y;
+          const intersect = ((yi > y) !== (yj > y)) &&
+            (x < (xj - xi) * (y - yi) / (yj - yi || Number.EPSILON) + xi);
+          if (intersect) {
+            inside = !inside;
+          }
+        }
+        return inside;
+      }
+
+      // Find the bar under (x,y). Sort NEAREST-first (ascending depth) so if two
+      // bars overlap on screen, the one closest to the viewer wins the hit —
+      // matching what the painter's algorithm drew on top.
+      function recordAt(x, y) {
+        const ordered = hitAreas.slice().sort((a, b) => a.depth - b.depth);
+        return ordered.find((area) =>
+          area.polygons.some((polygonPoints) => pointInPolygon(x, y, polygonPoints))
+        );
+      }
+
+      // Convert a pointer event's viewport coords to canvas-local CSS pixels
+      // (the same space project() outputs), so hit-testing lines up with drawing.
+      function canvasCoordinates(event) {
+        const bounds = canvas.getBoundingClientRect();
+        return {
+          x: event.clientX - bounds.left,
+          y: event.clientY - bounds.top
+        };
+      }
+
+      // Build + position the hover tooltip (a normal absolutely-positioned DOM
+      // element over the canvas, NOT drawn on it). Clamped to the stage bounds so
+      // it never overflows the panel. hideTooltip() just toggles the .visible class.
+      function showTooltip(record, x, y) {
+        tooltip.innerHTML = "";
+        const heading = document.createElement("strong");
+        heading.textContent = `${record.territory} — ${record.year}`;
+        tooltip.appendChild(heading);
+
+        const grid = document.createElement("div");
+        grid.className = "tooltip-grid";
+        [
+          ["Change", percentFormatter.format(record.change)],
+          ["Units sold", numberFormatter.format(record.current)],
+          ["Prior year", numberFormatter.format(record.prior)]
+        ].forEach(([label, value]) => {
+          const labelElement = document.createElement("span");
+          labelElement.textContent = label;
+          const valueElement = document.createElement("b");
+          valueElement.textContent = value;
+          grid.append(labelElement, valueElement);
+        });
+        tooltip.appendChild(grid);
+
+        const stageBounds = stage.getBoundingClientRect();
+        const tooltipX = Math.min(x + 16, stageBounds.width - 250);
+        const tooltipY = Math.max(12, Math.min(y + 16, stageBounds.height - 135));
+        tooltip.style.insetInlineStart = `${Math.max(12, tooltipX)}px`;
+        tooltip.style.insetBlockStart = `${tooltipY}px`;
+        tooltip.classList.add("visible");
+      }
+
+      function hideTooltip() {
+        tooltip.classList.remove("visible");
+      }
+
+      // Keep the live status text (aria-live) in sync with focus + FILTER state,
+      // so screen-reader users hear what changed after each interaction.
+      function updateStatus() {
+        const visibleCount = visibleRecords().length;
+        if (selectedKey) {
+          const selected = records.find((record) => record.key === selectedKey);
+          status.textContent = `Focused: ${selected.territory}, ${selected.year}, ${percentFormatter.format(selected.change)}`;
+        } else if (activeFilter !== "All") {
+          status.textContent = `Showing ${activeFilter}: ${visibleCount} annual changes`;
+        } else {
+          status.textContent = `Showing all ${visibleCount} annual changes`;
+        }
+      }
+
+      // "Reset view" handler: restore the default TILT + ZOOM and clear any
+      // focus/hover, then repaint. (Does NOT reset the FILTER dropdown.)
+      function resetView() {
+        rotationY = -0.72;
+        rotationX = 0.52;
+        zoom = 60;
+        selectedKey = null;
+        hoverKey = null;
+        hideTooltip();
+        updateStatus();
+        resizeCanvas();
+      }
+
+      // Build the accessible fallback table (territories × years) once at startup.
+      // Cells reuse the same red/green scale via a per-cell --heat custom property,
+      // giving a non-3D, fully readable equivalent of the visualization.
+      function buildTable() {
+        const table = document.getElementById("data-table");
+        const thead = document.createElement("thead");
+        const headingRow = document.createElement("tr");
+        ["State / territory", ...years].forEach((heading) => {
+          const th = document.createElement("th");
+          th.scope = "col";
+          th.textContent = heading;
+          headingRow.appendChild(th);
+        });
+        thead.appendChild(headingRow);
+
+        const tbody = document.createElement("tbody");
+        territories.forEach((territory) => {
+          const row = document.createElement("tr");
+          const rowHeading = document.createElement("th");
+          rowHeading.scope = "row";
+          rowHeading.textContent = territory;
+          row.appendChild(rowHeading);
+
+          years.forEach((year) => {
+            const record = records.find((item) => item.territory === territory && item.year === year);
+            const cell = document.createElement("td");
+            cell.textContent = percentFormatter.format(record.change);
+            cell.className = record.change < 0 ? "negative" : "positive";
+            const normalized = record.change < 0
+              ? Math.min(0.5, 0.08 + Math.abs(record.change / minNegative) * 0.36)
+              : Math.min(0.5, 0.06 + (record.change / maxPositive) * 0.36);
+            cell.style.setProperty("--heat", normalized.toFixed(3));
+            row.appendChild(cell);
+          });
+          tbody.appendChild(row);
+        });
+
+        table.append(thead, tbody);
+      }
+
+      // === TILT via drag — gesture start =====================================
+      // Record where the press began and capture the pointer so we keep getting
+      // moves even if the cursor leaves the canvas mid-drag. `dragged` starts
+      // false; it flips true only once the pointer moves past a small threshold,
+      // which lets pointerup tell a rotate-drag apart from a click-to-select.
+      canvas.addEventListener("pointerdown", (event) => {
+        pointerDown = true;
+        dragged = false;
+        pointerStart = canvasCoordinates(event);
+        previousPointer = pointerStart;
+        canvas.setPointerCapture(event.pointerId);
+        canvas.classList.add("dragging");
+      });
+
+      // === TILT via drag — motion + HOVER ====================================
+      // Two modes depending on whether a button is held:
+      //  A) Dragging → TILT: convert pixel delta since the last move into radians.
+      //     Horizontal drag → yaw (× 0.008), vertical drag → pitch (× 0.006, then
+      //     clamped to [minPitch, maxPitch]). Hide the tooltip and repaint. Tune
+      //     those two factors to change rotate sensitivity.
+      //  B) Not dragging → HOVER: hit-test under the cursor; if it changed, repaint
+      //     to redraw the highlight, and show/hide the tooltip + swap the cursor.
+      canvas.addEventListener("pointermove", (event) => {
+        const point = canvasCoordinates(event);
+        if (pointerDown) {
+          const deltaX = point.x - previousPointer.x;
+          const deltaY = point.y - previousPointer.y;
+          if (Math.hypot(point.x - pointerStart.x, point.y - pointerStart.y) > 4) {
+            dragged = true; // moved far enough → this is a rotate, not a click
+          }
+          rotationY += deltaX * 0.008;                                             // yaw
+          rotationX = Math.max(minPitch, Math.min(maxPitch, rotationX + deltaY * 0.006)); // pitch (clamped)
+          previousPointer = point;
+          hideTooltip();
+          hoverKey = null;
+          resizeCanvas();
+          return;
+        }
+
+        const hit = recordAt(point.x, point.y);
+        const nextHover = hit ? hit.key : null;
+        if (nextHover !== hoverKey) {
+          hoverKey = nextHover;
+          resizeCanvas();
+        }
+        if (hit) {
+          showTooltip(hit.record, point.x, point.y);
+          canvas.style.cursor = "pointer";
+        } else {
+          hideTooltip();
+          canvas.style.cursor = "grab";
+        }
+      });
+
+      // === CLICK-TO-FOCUS (only if it wasn't a drag) =========================
+      // On release, if the pointer never crossed the drag threshold treat it as a
+      // click: toggle focus on the hit bar (re-clicking or clicking empty space
+      // clears it). selectedKey drives the dimming of all other bars in render().
+      canvas.addEventListener("pointerup", (event) => {
+        const point = canvasCoordinates(event);
+        pointerDown = false;
+        canvas.classList.remove("dragging");
+        canvas.releasePointerCapture(event.pointerId);
+        if (!dragged) {
+          const hit = recordAt(point.x, point.y);
+          if (hit) {
+            selectedKey = selectedKey === hit.key ? null : hit.key;
+            hoverKey = hit.key;
+            showTooltip(hit.record, point.x, point.y);
+          } else {
+            selectedKey = null;
+            hoverKey = null;
+            hideTooltip();
+          }
+          updateStatus();
+          resizeCanvas();
+        }
+      });
+
+      // Cursor left the canvas (and not mid-drag): clear hover + tooltip, repaint.
+      canvas.addEventListener("pointerleave", () => {
+        if (!pointerDown) {
+          hoverKey = null;
+          hideTooltip();
+          resizeCanvas();
+        }
+      });
+
+      // === ZOOM via mouse wheel ==============================================
+      // Wheel up (deltaY<0) increases `zoom`, wheel down decreases it; clamped to
+      // [38, 96]. preventDefault + passive:false stop the page from scrolling so
+      // the gesture stays on the chart. 0.035 sets zoom speed. project() reads the
+      // new `zoom` on the next repaint.
+      canvas.addEventListener("wheel", (event) => {
+        event.preventDefault();
+        zoom = Math.max(38, Math.min(96, zoom - event.deltaY * 0.035));
+        resizeCanvas();
+      }, { passive: false });
+
+      // === KEYBOARD TILT + ZOOM (accessibility) ==============================
+      // Arrow keys drive TILT (Left/Right = yaw, Up/Down = pitch, clamped);
+      // +/= and -/_ drive ZOOM within the same [38, 96] clamp; Escape clears
+      // focus. Any handled key calls preventDefault() (to stop page scroll) and
+      // repaints. This makes every mouse-only interaction keyboard-reachable.
+      canvas.addEventListener("keydown", (event) => {
+        const rotateStep = 0.08;
+        if (event.key === "ArrowLeft") {
+          rotationY -= rotateStep;
+        } else if (event.key === "ArrowRight") {
+          rotationY += rotateStep;
+        } else if (event.key === "ArrowUp") {
+          rotationX = Math.max(minPitch, rotationX - rotateStep);
+        } else if (event.key === "ArrowDown") {
+          rotationX = Math.min(maxPitch, rotationX + rotateStep);
+        } else if (event.key === "+" || event.key === "=") {
+          zoom = Math.min(96, zoom + 4);
+        } else if (event.key === "-" || event.key === "_") {
+          zoom = Math.max(38, zoom - 4);
+        } else if (event.key === "Escape") {
+          selectedKey = null;
+          hoverKey = null;
+          hideTooltip();
+          updateStatus();
+        } else {
+          return;
+        }
+        event.preventDefault();
+        resizeCanvas();
+      });
+
+      // === FILTER change =====================================================
+      // Update `activeFilter` from the dropdown. If the currently focused bar is
+      // no longer visible under the new filter, drop the focus. Clear hover, sync
+      // the status line, and repaint — render() then draws only visibleRecords().
+      filter.addEventListener("change", () => {
+        activeFilter = filter.value;
+        if (selectedKey) {
+          const selected = records.find((record) => record.key === selectedKey);
+          if (activeFilter !== "All" && selected.territory !== activeFilter) {
+            selectedKey = null;
+          }
+        }
+        hoverKey = null;
+        hideTooltip();
+        updateStatus();
+        resizeCanvas();
+      });
+
+      resetButton.addEventListener("click", resetView);   // "Reset view" button
+      window.addEventListener("resize", resizeCanvas);     // keep canvas crisp on layout changes
+
+      // === BOOTSTRAP =========================================================
+      // Build the accessible table once, set the initial status text, then do the
+      // first paint. resizeCanvas() measures the canvas and calls render(); from
+      // here on, every repaint is triggered by an interaction handler above.
+      buildTable();
+      updateStatus();
+      resizeCanvas();
+    })();
+  </script>
+</body>
+</html>

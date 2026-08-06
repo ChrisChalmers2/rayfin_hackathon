@@ -1,0 +1,19 @@
+EVALUATE
+CALCULATETABLE(
+    ADDCOLUMNS(
+        SUMMARIZE(
+            locations,
+            locations[location_id],
+            locations[zone_name],
+            locations[x_coord],
+            locations[y_coord],
+            locations[z_coord]
+        ),
+        "delayed_count", CALCULATE(COUNTROWS(tasks), tasks[task_status] = "Delayed"),
+        "at_risk_count", CALCULATE(COUNTROWS(tasks), tasks[task_status] = "At Risk"),
+        "on_track_count", CALCULATE(COUNTROWS(tasks), tasks[task_status] = "On Track"),
+        "complete_count", CALCULATE(COUNTROWS(tasks), tasks[task_status] = "Complete"),
+        "total_tasks", CALCULATE(COUNTROWS(tasks))
+    ),
+    locations[project_id] = "__PROJECT_ID__"
+)

@@ -1,0 +1,58 @@
+name: F2 - Detect delayed tasks and alert Teams
+
+# Runs the F2 detection job on a schedule: finds Tasks that have flipped to
+# "delayed" and haven't been alerted on yet, posts a Teams Adaptive Card for
+# each, then marks them alerted. This exists because Rayfin itself has no
+# functions/cron/compute service (only auth, data/GraphQL, and static
+# hosting) - GitHub Actions is the scheduler.
+#
+# Required repo secrets (Settings -> Secrets and variables -> Actions):
+#   GRAPHQL_ENDPOINT    - the deployed Rayfin data API GraphQL URL
+#   AZURE_TENANT_ID     - Entra tenant ID for the service principal below
+#   AZURE_CLIENT_ID     - Entra App Registration (service principal) client ID
+#   AZURE_CLIENT_SECRET - service principal client secret
+#   TEAMS_WEBHOOK_URL   - Teams incoming webhook URL
+#
+# Auth: the job mints its own GraphQL bearer token every run via an Entra
+# service-principal client-credentials flow (see the "AUTH DECISION" comment
+# in detect-delayed-tasks.mjs) rather than storing a long-lived token that
+# would go stale between 5-minute runs.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  detect-and-alert:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/Delayed_Task_Notifier
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check required secrets are configured
+        id: secrets-check
+        run: |
+          if [ -z "${{ secrets.GRAPHQL_ENDPOINT }}" ] || [ -z "${{ secrets.AZURE_TENANT_ID }}" ] || [ -z "${{ secrets.AZURE_CLIENT_ID }}" ] || [ -z "${{ secrets.AZURE_CLIENT_SECRET }}" ] || [ -z "${{ secrets.TEAMS_WEBHOOK_URL }}" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping F2 detection job - GRAPHQL_ENDPOINT, AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, and/or TEAMS_WEBHOOK_URL repo secrets are not set yet. This is expected until F2 is deployed. See HANDOFF-TASK-F2.md for setup steps. This run is intentionally skipped, not failed."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.secrets-check.outputs.configured == 'true'
+        with:
+          node-version: "20"
+
+      - name: Run delayed-task detection job
+        if: steps.secrets-check.outputs.configured == 'true'
+        env:
+          GRAPHQL_ENDPOINT: ${{ secrets.GRAPHQL_ENDPOINT }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+        run: node scripts/detect-delayed-tasks.mjs

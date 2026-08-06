@@ -1,0 +1,10 @@
+EVALUATE
+CALCULATETABLE(
+    ROW(
+        "Total Actual Cost", [Total Actual Cost],
+        "Total Cost Overrun", [Total Cost Overrun],
+        "Delayed Task Count", [Delayed Task Count],
+        "Max Project Delay Days", [Max Project Delay Days]
+    ),
+    projects[project_id] = "__PROJECT_ID__"
+)

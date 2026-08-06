@@ -1,0 +1,9 @@
+# Template Fabric connection config. Replace the placeholder IDs with your
+# workspace and semantic model IDs before running the app.
+activeProfile: default
+profiles:
+  default:
+    semanticModels:
+      model:
+        workspaceId: 00000000-0000-0000-0000-000000000000
+        itemId: 00000000-0000-0000-0000-000000000000

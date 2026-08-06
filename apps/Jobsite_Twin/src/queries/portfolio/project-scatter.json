@@ -1,0 +1,30 @@
+{
+    "$schema": "https://vega.github.io/schema/vega-lite/v6.json",
+    "description": "Projects positioned by total cost overrun and average delay days, colored by status and sized by risk score.",
+    "data": {},
+    "mark": "circle",
+    "encoding": {
+        "x": { "field": "TotalCostOverrun", "type": "quantitative" },
+        "y": { "field": "AvgProjectDelayDays", "type": "quantitative" },
+        "color": {
+            "field": "Status",
+            "type": "nominal",
+            "scale": {
+                "domain": ["On Track", "At Risk", "Delayed"],
+                "range": ["#2e7d32", "#d97706", "#c62828"]
+            }
+        },
+        "size": {
+            "field": "RiskScore",
+            "type": "quantitative",
+            "scale": { "range": [80, 700] }
+        },
+        "tooltip": [
+            { "field": "ProjectName", "type": "nominal" },
+            { "field": "Status", "type": "nominal" },
+            { "field": "TotalCostOverrun", "type": "quantitative" },
+            { "field": "AvgProjectDelayDays", "type": "quantitative" },
+            { "field": "RiskScore", "type": "quantitative" }
+        ]
+    }
+}

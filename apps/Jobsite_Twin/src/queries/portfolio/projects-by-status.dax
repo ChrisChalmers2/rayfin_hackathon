@@ -1,0 +1,5 @@
+EVALUATE
+SUMMARIZECOLUMNS(
+    projects[status],
+    "Project Count", [Total Projects]
+)

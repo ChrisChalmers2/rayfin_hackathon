@@ -1,0 +1,9 @@
+EVALUATE
+SUMMARIZECOLUMNS(
+    projects[project_id],
+    projects[project_name],
+    projects[status],
+    projects[risk_score]__STATUS_FILTER_ARG__,
+    "Total Cost Overrun", [Total Cost Overrun],
+    "Avg Project Delay Days", [Avg Project Delay Days]
+)

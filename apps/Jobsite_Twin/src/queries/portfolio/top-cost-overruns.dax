@@ -1,0 +1,13 @@
+EVALUATE
+TOPN(
+    5,
+    SUMMARIZECOLUMNS(
+        projects[project_id],
+        projects[project_name],
+        projects[status]__STATUS_FILTER_ARG__,
+        "project_delay_days", [Avg Project Delay Days],
+        "total_cost_overrun", [Total Cost Overrun]
+    ),
+    [Total Cost Overrun], DESC
+)
+ORDER BY [Total Cost Overrun] DESC

@@ -1,0 +1,21 @@
+EVALUATE
+CALCULATETABLE(
+    SELECTCOLUMNS(
+        tasks,
+        "task_id", tasks[task_id],
+        "task_name", tasks[task_name],
+        "task_status", tasks[task_status],
+        "location_id", tasks[location_id],
+        "zone_name", RELATED(locations[zone_name]),
+        "planned_end_date", tasks[planned_end_date],
+        "actual_end_date", tasks[actual_end_date],
+        "delay_days",
+            IF(
+                NOT ISBLANK(tasks[actual_end_date]),
+                DATEDIFF(tasks[planned_end_date], tasks[actual_end_date], DAY),
+                BLANK()
+            )
+    ),
+    tasks[project_id] = "__PROJECT_ID__"
+)
+ORDER BY [task_id]

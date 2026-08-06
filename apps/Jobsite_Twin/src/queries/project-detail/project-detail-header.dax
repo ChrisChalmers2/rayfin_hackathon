@@ -1,0 +1,8 @@
+EVALUATE
+SELECTCOLUMNS(
+    FILTER(projects, projects[project_id] = "__PROJECT_ID__"),
+    "project_name", projects[project_name],
+    "status", projects[status],
+    "risk_score", projects[risk_score],
+    "is_outlier", projects[is_outlier]
+)

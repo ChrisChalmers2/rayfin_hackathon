@@ -1,0 +1,9 @@
+EVALUATE
+CALCULATETABLE(
+    ROW(
+        "Total Projects", [Total Projects],
+        "Delayed Project Count", [Delayed Project Count],
+        "Total Cost Overrun", [Total Cost Overrun],
+        "Avg Risk Score", [Avg Risk Score]
+    )__STATUS_FILTER_ARG__
+)
